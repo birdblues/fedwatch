@@ -1,0 +1,8 @@
+pandas
+numpy
+requests
+yfinance
+supabase
+beautifulsoup4
+python-dateutil
+plotly
