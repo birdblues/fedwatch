@@ -10,3 +10,4 @@ jax>=0.4.34,<0.5
 jaxlib>=0.4.34,<0.5
 numpyro>=0.15.0,<0.16
 arviz>=0.23.1
+python-dotenv

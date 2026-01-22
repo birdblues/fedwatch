@@ -16,11 +16,12 @@ create table if not exists public.macro_state_daily (
   hy_oas float8,
   stlfsi4 float8,
   vix float8,
-  hmm_score float8,
-  prob_regime_0 float8,
-  prob_regime_1 float8,
-  prob_regime_2 float8,
-  prob_regime_3 float8,
+  hmm_score_raw float8,
+  hmm_score_0_100 float8,
+  prob_state_0 float8,
+  prob_state_1 float8,
+  prob_state_2 float8,
+  prob_state_3 float8,
   updated_at timestamptz default now()
 );
 

@@ -1,10 +1,15 @@
-# scripts/pipeline_daily.py
 """
 Macro Regime Pipeline (Option C: Release-time aware DAILY state machine)
 
 - Monthly macro indicators are applied from their FRED "realtime_start" (availability date) -> daily forward-fill
 - Daily market stress is computed daily (SPX/VIX + HY OAS + STLFSI4)
 - Daily state is saved to Supabase (upsert by date)
+
+HMM (Option B: Continuous score)
+- If models/hmm_v1.npz exists, run forward-backward on features and produce:
+  - prob_state_0..K-1
+  - hmm_score_raw
+  - hmm_score_0_100  (rolling quantile min/max mapping)
 
 Run:
   python scripts/pipeline_daily.py --start 2000-01-01 --end 2026-01-18 --print-latest
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 import time
@@ -62,6 +68,12 @@ YF_TICKERS = {
 
 USER_AGENT = "macro-regime-pipeline/daily-1.0"
 
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models",
+    "hmm_v1.npz",
+)
+
 
 # -----------------------------
 # Helpers
@@ -86,7 +98,7 @@ def safe_float(x) -> float:
         return np.nan
 
 
-# ✅ pandas datetime64[ns] safe upper bound (prevents 9999-12-31 crash)
+# pandas datetime64[ns] safe upper bound (prevents 9999-12-31 crash)
 PANDAS_TS_MAX_SAFE = pd.Timestamp("2262-04-11")
 
 
@@ -100,13 +112,11 @@ def safe_fred_ts(x) -> pd.Timestamp:
         return pd.NaT
 
     if isinstance(x, pd.Timestamp):
-        # ensure tz-naive comparison
         ts = x.tz_localize(None) if getattr(x, "tzinfo", None) else x
         return ts if ts <= PANDAS_TS_MAX_SAFE else PANDAS_TS_MAX_SAFE
 
     s = str(x)
 
-    # quick year check to avoid out-of-bounds conversion
     try:
         y = int(s[:4])
         if y > 2262:
@@ -168,220 +178,13 @@ def perf_stats_from_returns(r: pd.Series, freq: str = "D") -> Dict[str, Any]:
     }
 
 
-# -----------------------------
-# HMM Helpers (NumPy Inference)
-# -----------------------------
-def logsumexp_np(a, axis=None, keepdims=False):
-    a = np.asarray(a)
-    amax = np.max(a, axis=axis, keepdims=True)
-    out = np.log(np.sum(np.exp(a - amax), axis=axis, keepdims=True)) + amax
-    return out if keepdims else np.squeeze(out, axis=axis)
-
-
-def mvn_logpdf_np(x, mu, cov):
-    # x:(D,), mu:(D,), cov:(D,D)
-    D = x.shape[0]
-    # add small jitter if needed, or assume trained cov is good.
-    # robust cholesky?
-    try:
-        L = np.linalg.cholesky(cov)
-    except np.linalg.LinAlgError:
-        # fallback jitter
-        L = np.linalg.cholesky(cov + np.eye(D) * 1e-6)
-        
-    y = np.linalg.solve(L, x - mu)
-    quad = np.dot(y, y)
-    logdet = np.sum(np.log(np.diag(L)))
-    return -0.5 * (D * np.log(2 * np.pi) + 2 * logdet + quad)
-
-
-def forward_backward_gamma(X, pi, A, mus, covs):
-    """
-    X:(T,D), pi:(K,), A:(K,K), mus:(K,D), covs:(K,D,D)
-    return gamma:(T,K)
-    """
-    T, D = X.shape
-    K = pi.shape[0]
-
-    emit = np.zeros((T, K))
-    for t in range(T):
-        row = X[t]
-        # if any nan in row, emit is 0 log prob? or uniform?
-        # we assume X is clean (ffill/dropna handled before)
-        if np.any(np.isnan(row)):
-             # Treat as missing obs -> uniform emission or skip update (complicated)
-             # Simple approach: uniform log prob (0 if normalized, but here logpdf... just set 0 means likelihood 1)
-             # But logic implies sum to 1.
-             # Let's assume input X is cleaned.
-             pass
-        
-        for k in range(K):
-            emit[t, k] = mvn_logpdf_np(row, mus[k], covs[k])
-
-    logA = np.log(A + 1e-30)
-    logpi = np.log(pi + 1e-30)
-
-    # forward
-    alpha = np.zeros((T, K))
-    alpha[0] = logpi + emit[0]
-    for t in range(1, T):
-        m = alpha[t - 1][:, None] + logA  # (K,K)
-        alpha[t] = emit[t] + logsumexp_np(m, axis=0)
-
-    # backward
-    beta = np.zeros((T, K))
-    beta[-1] = 0.0
-    for t in range(T - 2, -1, -1):
-        m = logA + emit[t + 1][None, :] + beta[t + 1][None, :]
-        beta[t] = logsumexp_np(m, axis=1)
-
-    log_gamma = alpha + beta
-    log_gamma = log_gamma - logsumexp_np(log_gamma, axis=1, keepdims=True)
-    gamma = np.exp(log_gamma)
-    return gamma
-
-
-def make_hmm_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Constructs the feature matrix X for HMM.
-    1. cpi_gap = core_cpi_yoy - core_cpi_yoy_med
-    2. orders_yoy
-    3. orders_gap = orders_mom - orders_mom_med
-    4. unrate_chg_3m
-    5. yc_10y2y
-    6. hy_oas
-    7. vix
-    8. stress_score
-    """
-    d = df.copy()
-    
-    # We need to handle NaNs because HMM cannot take NaNs
-    # Strategy: ffill first, then we might drop leading NaNs outside of this function
-    # But to return aligned DF, we keep index.
-    
-    # 1. cpi_gap
-    cpi_gap = d["core_cpi_yoy"] - d["core_cpi_yoy_med"]
-    
-    # 3. orders_gap
-    orders_gap = d["orders_mom"] - d["orders_mom_med"]
-    
-    X = pd.DataFrame({
-        "cpi_gap": cpi_gap,
-        "orders_yoy": d["orders_yoy"],
-        "orders_gap": orders_gap,
-        "unrate_chg": d["unrate_chg_3m"],
-        "yc_10y2y": d["yc_10y2y"],
-        "hy_oas": d["hy_oas"],
-        "vix": d["vix"],
-        "stress_score": d["stress_score"]
-    }, index=d.index)
-    
-    return X
-
-
-# -----------------------------
-# HMM Helpers (NumPy Inference)
-# -----------------------------
-def logsumexp_np(a, axis=None, keepdims=False):
-    a = np.asarray(a)
-    amax = np.max(a, axis=axis, keepdims=True)
-    out = np.log(np.sum(np.exp(a - amax), axis=axis, keepdims=True)) + amax
-    return out if keepdims else np.squeeze(out, axis=axis)
-
-
-def mvn_logpdf_np(x, mu, cov):
-    # x:(D,), mu:(D,), cov:(D,D)
-    D = x.shape[0]
-    # add small jitter if needed, or assume trained cov is good.
-    # robust cholesky?
-    try:
-        L = np.linalg.cholesky(cov)
-    except np.linalg.LinAlgError:
-        # fallback jitter
-        L = np.linalg.cholesky(cov + np.eye(D) * 1e-6)
-        
-    y = np.linalg.solve(L, x - mu)
-    quad = np.dot(y, y)
-    logdet = np.sum(np.log(np.diag(L)))
-    return -0.5 * (D * np.log(2 * np.pi) + 2 * logdet + quad)
-
-
-def forward_backward_gamma(X, pi, A, mus, covs):
-    """
-    X:(T,D), pi:(K,), A:(K,K), mus:(K,D), covs:(K,D,D)
-    return gamma:(T,K)
-    """
-    T, D = X.shape
-    K = pi.shape[0]
-
-    emit = np.zeros((T, K))
-    for t in range(T):
-        row = X[t]
-        if np.any(np.isnan(row)):
-             pass
-        
-        for k in range(K):
-            emit[t, k] = mvn_logpdf_np(row, mus[k], covs[k])
-
-    logA = np.log(A + 1e-30)
-    logpi = np.log(pi + 1e-30)
-
-    # forward
-    alpha = np.zeros((T, K))
-    alpha[0] = logpi + emit[0]
-    for t in range(1, T):
-        m = alpha[t - 1][:, None] + logA  # (K,K)
-        alpha[t] = emit[t] + logsumexp_np(m, axis=0)
-
-    # backward
-    beta = np.zeros((T, K))
-    beta[-1] = 0.0
-    for t in range(T - 2, -1, -1):
-        m = logA + emit[t + 1][None, :] + beta[t + 1][None, :]
-        beta[t] = logsumexp_np(m, axis=1)
-
-    log_gamma = alpha + beta
-    log_gamma = log_gamma - logsumexp_np(log_gamma, axis=1, keepdims=True)
-    gamma = np.exp(log_gamma)
-    return gamma
-
-
-def make_hmm_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Constructs the feature matrix X for HMM.
-    1. cpi_gap = core_cpi_yoy - core_cpi_yoy_med
-    2. orders_yoy
-    3. orders_gap = orders_mom - orders_mom_med
-    4. unrate_chg_3m
-    5. yc_10y2y
-    6. hy_oas
-    7. vix
-    8. stress_score
-    """
-    d = df.copy()
-    
-    # We need to handle NaNs because HMM cannot take NaNs
-    # Strategy: ffill first, then we might drop leading NaNs outside of this function
-    # But to return aligned DF, we keep index.
-    
-    # 1. cpi_gap
-    cpi_gap = d["core_cpi_yoy"] - d["core_cpi_yoy_med"]
-    
-    # 3. orders_gap
-    orders_gap = d["orders_mom"] - d["orders_mom_med"]
-    
-    X = pd.DataFrame({
-        "cpi_gap": cpi_gap,
-        "orders_yoy": d["orders_yoy"],
-        "orders_gap": orders_gap,
-        "unrate_chg": d["unrate_chg_3m"],
-        "yc_10y2y": d["yc_10y2y"],
-        "hy_oas": d["hy_oas"],
-        "vix": d["vix"],
-        "stress_score": d["stress_score"]
-    }, index=d.index)
-    
-    return X
+def _logsumexp(a: np.ndarray, axis: Optional[int] = None, keepdims: bool = False) -> np.ndarray:
+    a = np.asarray(a, dtype=float)
+    m = np.max(a, axis=axis, keepdims=True)
+    out = m + np.log(np.sum(np.exp(a - m), axis=axis, keepdims=True))
+    if not keepdims:
+        out = np.squeeze(out, axis=axis)
+    return out
 
 
 # -----------------------------
@@ -410,7 +213,7 @@ class FredClient:
           - realtime_start (datetime)
           - realtime_end (datetime)
 
-        ✅ 핵심:
+        핵심:
         - FRED는 realtime_end가 '오늘'보다 미래면 안 되고, 예외적으로 '9999-12-31'만 허용.
         - pandas는 9999-12-31을 timestamp로 못 읽으므로 "요청은 9999", "파싱은 safe_fred_ts로 캡" 전략.
         """
@@ -427,13 +230,10 @@ class FredClient:
             ot = int(output_type)
             params["output_type"] = ot
 
-            # output_type=2/3/4 (vintage 관련) 은 realtime 범위 필요
             if ot in (2, 3, 4):
                 params["realtime_start"] = realtime_start or "1776-07-04"
-                # FRED 규칙상 미래면 안 되는데 '9999-12-31'만 허용이므로 기본은 항상 9999.
                 params["realtime_end"] = realtime_end or "9999-12-31"
             else:
-                # ot=1 등은 realtime 범위 굳이 안 줌 (caller가 주면 그대로 전달)
                 if realtime_start is not None:
                     params["realtime_start"] = realtime_start
                 if realtime_end is not None:
@@ -497,9 +297,6 @@ class FredClient:
         - effective_col(기본 realtime_start) 있으면 그 날짜부터 value가 "사용 가능"하다고 보고 asof merge.
         - effective_col 없으면 date_col(기본 obs_date) 사용
         - 그것도 없으면 index 사용
-
-        ✅ FIX: index fallback 시 reset_index()가 만들어주는 컬럼명이
-        'index'가 아닐 수 있음(예: index.name='obs_date') → '__idx' rename이 실패하던 버그 수정
         """
         if obs_df is None or len(obs_df) == 0:
             idx = pd.date_range(pd.to_datetime(start), pd.to_datetime(end), freq=freq)
@@ -507,33 +304,25 @@ class FredClient:
 
         out = obs_df.copy()
 
-        # ---- effective date column 결정 ----
         if effective_col in out.columns:
             eff_col = effective_col
         elif date_col in out.columns:
             eff_col = date_col
         else:
-            # index fallback: reset_index가 만든 "index 컬럼" 이름을 찾아서 '__idx'로 통일
             out2 = out.reset_index()
-
-            # reset_index로 추가된 컬럼(=기존 index 컬럼들) 찾기
             added_cols = [c for c in out2.columns if c not in out.columns]
             if not added_cols:
-                # 극단 케이스 방어
                 added_cols = [out2.columns[0]]
-
             idx_src = added_cols[0]
             out2 = out2.rename(columns={idx_src: "__idx"})
             eff_col = "__idx"
             out = out2
 
-        # ---- datetime coercion ----
         out[eff_col] = pd.to_datetime(out[eff_col], errors="coerce")
 
-        # ---- value column 1D 강제 ----
         if value_col in out.columns:
             col = out.loc[:, value_col]
-            if isinstance(col, pd.DataFrame):  # 중복 컬럼/2D 방어
+            if isinstance(col, pd.DataFrame):
                 col = col.iloc[:, 0]
             out[value_col] = pd.to_numeric(col, errors="coerce")
         else:
@@ -541,7 +330,6 @@ class FredClient:
 
         eff = out[[eff_col, value_col]].dropna().copy().sort_values(eff_col)
 
-        # ---- tz normalize ----
         s_ts = pd.to_datetime(start)
         e_ts = pd.to_datetime(end)
         if getattr(s_ts, "tzinfo", None) is not None:
@@ -551,7 +339,6 @@ class FredClient:
 
         idx = pd.date_range(s_ts, e_ts, freq=freq)
 
-        # ---- asof merge ----
         daily = pd.DataFrame({eff_col: idx})
         merged = pd.merge_asof(
             daily.sort_values(eff_col),
@@ -572,26 +359,14 @@ class FredClient:
 def fetch_yf_daily_close(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     if yf is None:
         return pd.Series(dtype=float)
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            df = yf.download(
-                ticker,
-                start=str(start.date()),
-                end=str((end + pd.Timedelta(days=1)).date()),
-                progress=False,
-            )
-            if df is not None and not df.empty:
-                break
-            time.sleep(2 * (attempt + 1))  # backoff
-        except Exception as e:
-            print(f"[WARN] yfinance fetch {ticker} failed (attempt {attempt+1}/{max_retries}): {e}", file=sys.stderr)
-            time.sleep(3 * (attempt + 1))
-
+    df = yf.download(
+        ticker,
+        start=str(start.date()),
+        end=str((end + pd.Timedelta(days=1)).date()),
+        progress=False,
+    )
     if df is None or df.empty:
         return pd.Series(dtype=float)
-
     if isinstance(df.columns, pd.MultiIndex):
         close = df["Close"].iloc[:, 0]
     else:
@@ -599,6 +374,254 @@ def fetch_yf_daily_close(ticker: str, start: pd.Timestamp, end: pd.Timestamp) ->
     close = close.dropna()
     close.name = ticker
     return close
+
+
+# -----------------------------
+# HMM Feature builder (must be consistent with training)
+# -----------------------------
+def make_hmm_features(state: pd.DataFrame) -> pd.DataFrame:
+    """
+    Must output (at least) these columns used in training:
+      - cpi_gap: core_cpi_yoy - core_cpi_yoy_med
+      - orders_yoy
+      - orders_gap: orders_mom - orders_mom_med
+      - unrate_chg: unrate_chg_3m
+      - yc_10y2y
+      - hy_oas
+      - vix
+      - stress_score
+    Index: DatetimeIndex (same as state index)
+    """
+    if not isinstance(state.index, pd.DatetimeIndex):
+        raise RuntimeError("make_hmm_features: state must have DatetimeIndex")
+
+    required = [
+        "core_cpi_yoy",
+        "core_cpi_yoy_med",
+        "orders_yoy",
+        "orders_mom",
+        "orders_mom_med",
+        "unrate_chg_3m",
+        "yc_10y2y",
+        "hy_oas",
+        "vix",
+        "stress_score",
+    ]
+    missing = [c for c in required if c not in state.columns]
+    if missing:
+        raise RuntimeError(f"make_hmm_features: missing columns in state: {missing}")
+
+    X = pd.DataFrame(index=state.index)
+    X["cpi_gap"] = pd.to_numeric(state["core_cpi_yoy"], errors="coerce") - pd.to_numeric(state["core_cpi_yoy_med"], errors="coerce")
+    X["orders_yoy"] = pd.to_numeric(state["orders_yoy"], errors="coerce")
+    X["orders_gap"] = pd.to_numeric(state["orders_mom"], errors="coerce") - pd.to_numeric(state["orders_mom_med"], errors="coerce")
+    X["unrate_chg"] = pd.to_numeric(state["unrate_chg_3m"], errors="coerce")
+    X["yc_10y2y"] = pd.to_numeric(state["yc_10y2y"], errors="coerce")
+    X["hy_oas"] = pd.to_numeric(state["hy_oas"], errors="coerce")
+    X["vix"] = pd.to_numeric(state["vix"], errors="coerce")
+    X["stress_score"] = pd.to_numeric(state["stress_score"], errors="coerce")
+    return X
+
+
+def _resample_like_training(X_df: pd.DataFrame, meta: Dict[str, Any], daily_idx: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Train_hmm may have used freq=B/D/W. In inference, we:
+      - build raw daily features on business days
+      - resample to training freq
+      - then forward-fill back to business daily index (so pipeline stays daily)
+    """
+    freq = str(meta.get("freq", "B")).upper()
+    if freq == "B":
+        Xr = X_df.copy()
+        return Xr.reindex(daily_idx).ffill()
+    if freq == "D":
+        idx = pd.date_range(X_df.index.min(), X_df.index.max(), freq="D")
+        Xd = X_df.reindex(idx).ffill()
+        return Xd.reindex(daily_idx, method="ffill")
+    if freq == "W":
+        anchor = str(meta.get("weekly_anchor", "FRI")).upper()
+        rule = f"W-{anchor}"
+        Xw = X_df.resample(rule).last().ffill()
+        return Xw.reindex(daily_idx, method="ffill")
+    raise ValueError(f"Unknown training freq={freq}")
+
+
+def _mvnorm_logpdf_all(X: np.ndarray, mus: np.ndarray, covs: np.ndarray, jitter: float = 1e-6) -> np.ndarray:
+    """
+    X:   (T,D)
+    mus: (K,D)
+    cov: (K,D,D)
+    returns logp: (T,K)
+    """
+    T, D = X.shape
+    K = mus.shape[0]
+    logp = np.zeros((T, K), dtype=float)
+
+    for k in range(K):
+        mu = mus[k]
+        cov = covs[k]
+        cov = cov + np.eye(D) * jitter
+
+        try:
+            L = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            cov = cov + np.eye(D) * (jitter * 10.0)
+            L = np.linalg.cholesky(cov)
+
+        Xm = (X - mu[None, :]).T
+        y = np.linalg.solve(L, Xm)
+        quad = np.sum(y * y, axis=0)
+        logdet = 2.0 * np.sum(np.log(np.diag(L)))
+        logp[:, k] = -0.5 * (D * np.log(2.0 * np.pi) + logdet + quad)
+
+    return logp
+
+
+def _forward_backward_loggamma(log_emit: np.ndarray, logpi: np.ndarray, logA: np.ndarray) -> np.ndarray:
+    """
+    log_emit: (T,K)
+    logpi: (K,)
+    logA: (K,K) row=prev col=next
+    returns log_gamma: (T,K) normalized (each t sums to 1 in prob space)
+    """
+    T, K = log_emit.shape
+    log_alpha = np.zeros((T, K), dtype=float)
+    log_beta = np.zeros((T, K), dtype=float)
+
+    log_alpha[0] = logpi + log_emit[0]
+    log_alpha[0] -= _logsumexp(log_alpha[0], axis=0)
+
+    for t in range(1, T):
+        tmp = log_alpha[t - 1][:, None] + logA
+        log_alpha[t] = log_emit[t] + _logsumexp(tmp, axis=0)
+        log_alpha[t] -= _logsumexp(log_alpha[t], axis=0)
+
+    log_beta[T - 1] = 0.0
+    for t in range(T - 2, -1, -1):
+        tmp = logA + log_emit[t + 1][None, :] + log_beta[t + 1][None, :]
+        log_beta[t] = _logsumexp(tmp, axis=1)
+        log_beta[t] -= _logsumexp(log_beta[t], axis=0)
+
+    log_gamma = log_alpha + log_beta
+    log_gamma -= _logsumexp(log_gamma, axis=1, keepdims=True)
+    return log_gamma
+
+
+def _hmm_score_0_100(raw: pd.Series, freq: str, window_years: float = 5.0) -> pd.Series:
+    """
+    Convert raw continuous score to 0..100 using rolling quantile min/max.
+    Similar vibe to fear/greed: "최근 n년에서 어디쯤?"
+    """
+    freq = freq.upper()
+    if freq == "W":
+        win = int(np.ceil(52 * window_years))
+        minp = max(26, int(win * 0.4))
+    elif freq == "D":
+        win = int(np.ceil(365 * window_years))
+        minp = max(90, int(win * 0.4))
+    else:  # B
+        win = int(np.ceil(252 * window_years))
+        minp = max(63, int(win * 0.4))
+
+    q_lo = raw.rolling(win, min_periods=minp).quantile(0.05)
+    q_hi = raw.rolling(win, min_periods=minp).quantile(0.95)
+
+    denom = (q_hi - q_lo).replace(0, np.nan)
+    s = 100.0 * (raw - q_lo) / denom
+    return s.clip(0.0, 100.0)
+
+
+def try_apply_hmm(state: pd.DataFrame, model_path: str, debug: bool = False) -> pd.DataFrame:
+    """
+    If model exists, compute:
+      - prob_state_0..K-1
+      - hmm_score_raw
+      - hmm_score_0_100
+    """
+    if not model_path or (not os.path.exists(model_path)):
+        if debug:
+            eprint(f"[HMM] model not found: {model_path}")
+        return state
+
+    m = np.load(model_path, allow_pickle=True)
+
+    required = ["pi", "A", "mus", "covs", "mean", "std", "meta_feature_cols", "meta_json", "beta_state"]
+    missing = [k for k in required if k not in m.files]
+    if missing:
+        raise RuntimeError(f"[HMM] model file missing keys: {missing} in {model_path}")
+
+    pi = np.asarray(m["pi"], dtype=float)
+    A = np.asarray(m["A"], dtype=float)
+    mus = np.asarray(m["mus"], dtype=float)
+    covs = np.asarray(m["covs"], dtype=float)
+    mean = np.asarray(m["mean"], dtype=float)
+    std = np.asarray(m["std"], dtype=float)
+    beta_state = np.asarray(m["beta_state"], dtype=float)
+
+    meta_cols = m["meta_feature_cols"]
+    meta_cols = meta_cols.tolist() if isinstance(meta_cols, np.ndarray) else list(meta_cols)
+    meta_cols = [str(c) for c in meta_cols]
+
+    meta_json_arr = m["meta_json"]
+    meta_json = str(meta_json_arr[0]) if isinstance(meta_json_arr, np.ndarray) else str(meta_json_arr)
+    meta = {}
+    try:
+        meta = json.loads(meta_json)
+    except Exception:
+        meta = {}
+
+    K = int(mus.shape[0])
+
+    # ---- build features ----
+    X_df = make_hmm_features(state)
+    X_df = X_df.sort_index()
+
+    # align to training freq then ffill back to business daily
+    X_rs = _resample_like_training(X_df, meta=meta, daily_idx=state.index)
+
+    missing_cols = [c for c in meta_cols if c not in X_rs.columns]
+    if missing_cols:
+        raise RuntimeError(
+            f"[HMM] missing required feature columns for inference: {missing_cols}\n"
+            f"  - model expects: {meta_cols}\n"
+            f"  - got: {list(X_rs.columns)}"
+        )
+    X_use = X_rs.loc[:, meta_cols].ffill()
+
+    X_val = X_use.values.astype(float)
+    nan_mask = ~np.isfinite(X_val)
+    if nan_mask.any():
+        # Fall back to training means so standardized values become ~0.
+        X_val[nan_mask] = np.take(mean, np.where(nan_mask)[1])
+    X_scaled = (X_val - mean[None, :]) / (std[None, :] + 1e-6)
+
+    log_emit = _mvnorm_logpdf_all(X_scaled, mus=mus, covs=covs)
+
+    logpi = np.log(pi + 1e-30)
+    logA = np.log(A + 1e-30)
+
+    log_gamma = _forward_backward_loggamma(log_emit, logpi=logpi, logA=logA)
+    gamma = np.exp(log_gamma)
+
+    hmm_raw = gamma @ beta_state.reshape(-1, 1)
+    hmm_raw = hmm_raw[:, 0]
+    hmm_raw_s = pd.Series(hmm_raw, index=state.index, name="hmm_score_raw")
+
+    train_freq = str(meta.get("freq", "B")).upper()
+    hmm_0_100 = _hmm_score_0_100(hmm_raw_s, freq=train_freq, window_years=5.0).rename("hmm_score_0_100")
+
+    out = state.copy()
+    for k in range(K):
+        out[f"prob_state_{k}"] = gamma[:, k]
+
+    out["hmm_score_raw"] = hmm_raw_s
+    out["hmm_score_0_100"] = hmm_0_100
+
+    if debug:
+        eprint(f"[HMM] loaded {model_path} | K={K} | train_freq={train_freq} | cols={meta_cols}")
+        eprint(f"[HMM] beta_state: {beta_state}")
+
+    return out
 
 
 # -----------------------------
@@ -652,10 +675,8 @@ def build_daily_state(
         if latest.empty:
             return latest
 
-        # ✅ output_type=1의 realtime_start/end는 "요청 구간" 의미라서 신뢰하지 않음
         latest["realtime_start"] = pd.NaT
 
-        # ✅ initial release (vintage)로 release_start 만들기
         try:
             initial = fred.fetch_observations(
                 series_id,
@@ -680,16 +701,14 @@ def build_daily_state(
 
         out = latest.merge(rel, on="obs_date", how="left")
 
-        # ✅ fallback: release_start가 없으면 "obs_date 다음달 중순"으로 가정
         fallback_release = (
             pd.to_datetime(out["obs_date"])
-            + pd.offsets.MonthBegin(1)  # 다음달 1일
-            + pd.Timedelta(days=14)     # 다음달 15일
+            + pd.offsets.MonthBegin(1)
+            + pd.Timedelta(days=14)
         )
 
         out["realtime_start"] = pd.to_datetime(out["release_start"], errors="coerce").fillna(fallback_release)
 
-        # (선택) 혹시라도 미래로 튀면 end로 캡
         end_ts = pd.to_datetime(end)
         out["realtime_start"] = out["realtime_start"].where(out["realtime_start"] <= end_ts, end_ts)
 
@@ -845,17 +864,10 @@ def build_daily_state(
     stlfsi_z = robust_zscore(stlfsi4_raw, window=252, min_periods=63).fillna(0.0)
 
     w_vix, w_dd, w_cr, w_fsi = 0.35, 0.35, 0.20, 0.10
-
-    # ✅ FIX: 상쇄 방지(각 컴포넌트별로 '스트레스(양의 편차)'만 반영)
-    vix_pos = vix_z.clip(lower=0.0)
-    dd_pos = dd_z.clip(lower=0.0)
-    credit_pos = credit_z.clip(lower=0.0)
-    stlfsi_pos = stlfsi_z.clip(lower=0.0)
-
-    contrib_vix = w_vix * vix_pos
-    contrib_dd = w_dd * dd_pos
-    contrib_cr = w_cr * credit_pos
-    contrib_fsi = w_fsi * stlfsi_pos
+    contrib_vix = w_vix * vix_z
+    contrib_dd = w_dd * dd_z
+    contrib_cr = w_cr * credit_z
+    contrib_fsi = w_fsi * stlfsi_z
 
     stress_score = (contrib_vix + contrib_dd + contrib_cr + contrib_fsi).clip(lower=0.0)
     stress_score.name = "stress_score"
@@ -873,7 +885,7 @@ def build_daily_state(
     driver = driver.where(stress_score > 0.1, other="none")
     driver.name = "stress_driver"
 
-    # ---- 5) Regime
+    # ---- 5) Regime (rule-based)
     infl_hot = (core_cpi_yoy > core_cpi_yoy_med) | (core_cpi_yoy >= 3.0)
     growth_ok = (orders_yoy >= 0.0) & (orders_mom >= orders_mom_med) & (unrate_chg_3m <= 0.2)
 
@@ -897,7 +909,7 @@ def build_daily_state(
     regime_label = pd.Series(regime_label_list, index=daily_idx, name="regime_label")
 
     yc_10y2y = (dgs10 - dgs2).rename("yc_10y2y")
-    
+
     # ---- 6) Assemble
     out = pd.DataFrame(index=daily_idx)
     out["date"] = out.index.date
@@ -908,7 +920,6 @@ def build_daily_state(
     out["stress_flag"] = stress_flag.astype(bool)
     out["stress_driver"] = driver.astype(str)
 
-    # debug cols (persistable)
     out["core_cpi_yoy"] = core_cpi_yoy
     out["core_cpi_yoy_med"] = core_cpi_yoy_med
     out["orders_yoy"] = orders_yoy
@@ -920,78 +931,6 @@ def build_daily_state(
     out["stlfsi4"] = stlfsi4_raw
     out["vix"] = vix
 
-    # ---- 7) Bayesian HMM Inference (if model exists)
-    # Check for models/hmm_v1.npz
-    model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "hmm_v1.npz")
-    if os.path.exists(model_path):
-        try:
-            model_data = np.load(model_path)
-            # Load params
-            pi = model_data["pi"]     # (K,)
-            A = model_data["A"]       # (K,K)
-            mus = model_data["mus"]   # (K,D)
-            covs = model_data["covs"] # (K,D,D)
-            x_mean = model_data["mean"] # (D,)
-            x_std = model_data["std"]   # (D,)
-            
-            # Prepare X
-            # Use make_hmm_features we defined. 
-            # Note: out df has the required raw columns now.
-            X_df = make_hmm_features(out)
-            
-            # Align with X_df columns order?
-            # We must ensure column order matches training.
-            # In make_hmm_features, we fixed the order: 
-            # cpi_gap, orders_yoy, orders_gap, unrate_chg, yc_10y2y, hy_oas, vix, stress_score
-            # Let's assume training used the same function.
-            
-            # Clean X for inference (no NaNs allowed)
-            # We can't forward-backward easily with NaNs in the middle without modifications.
-            # Simple strategy: Fillna with 0 (mean) since it's standardized? 
-            # Or ffill?
-            # Let's use ffill then bfill (to keep length T)
-            X_filled = X_df.ffill().bfill().fillna(0.0) 
-            
-            X_val = X_filled.values
-            
-            # Standardize
-            X_norm = (X_val - x_mean) / (x_std + 1e-6)
-            
-            # Run Inference
-            gamma = forward_backward_gamma(X_norm, pi, A, mus, covs) # (T, K)
-            
-            # Calc Score
-            # Option B: Good regimes = Goldilocks(0), Reflation(1) ??
-            # Need to know which index corresponds to which.
-            # The user code doesn't strictly enforce label mapping, PyMC sorts by something or random?
-            # Usually we need to Identify regimes after training.
-            # For now, let's assume the user handles label identification or we use a heuristic score.
-            # User suggested: score = 100 * sum(gamma[:, good_idx])
-            # Or weighted score.
-            
-            # Let's save the gamma columns so user can inspect or compute score later?
-            # Or compute a score based on "Good" regimes.
-            # Ideally, fit logic should save "score_weights" or similar.
-            # If not present, we might just save gammas.
-            
-            if "score_weights" in model_data:
-                score_k = model_data["score_weights"]
-                hmm_score = np.sum(gamma * score_k[None, :], axis=1)
-            else:
-                # Default fallback if explicit weights not saved
-                # Maybe assuming K=4 and order? Unsafe.
-                # Just save gammas for now.
-                hmm_score = np.full(len(out), np.nan)
-
-            # Assign to DataFrame
-            out["hmm_score"] = hmm_score
-            for k in range(gamma.shape[1]):
-                out[f"prob_regime_{k}"] = gamma[:, k]
-                
-        except Exception as e:
-            if debug:
-                eprint(f"[WARN] HMM Inference failed: {e}")
-    
     return out
 
 
@@ -1080,36 +1019,39 @@ class SupabaseWriter:
 
 
 def make_rows_for_supabase(state_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    now_utc = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     out: List[Dict[str, Any]] = []
 
+    prob_cols = [c for c in state_df.columns if c.startswith("prob_state_")]
+
     for _, row in state_df.iterrows():
-        out.append(
-            {
-                "date": str(row["date"]),
-                "regime_id": int(row["regime_id"]),
-                "regime_label": str(row["regime_label"]),
-                "stress_flag": bool(row["stress_flag"]),
-                "stress_score": None if pd.isna(row["stress_score"]) else float(row["stress_score"]),
-                "stress_driver": str(row["stress_driver"]) if "stress_driver" in row else None,
-                "core_cpi_yoy": None if pd.isna(row["core_cpi_yoy"]) else float(row["core_cpi_yoy"]),
-                "core_cpi_yoy_med": None if pd.isna(row.get("core_cpi_yoy_med", np.nan)) else float(row["core_cpi_yoy_med"]),
-                "orders_yoy": None if pd.isna(row["orders_yoy"]) else float(row["orders_yoy"]),
-                "orders_mom": None if pd.isna(row.get("orders_mom", np.nan)) else float(row["orders_mom"]),
-                "orders_mom_med": None if pd.isna(row.get("orders_mom_med", np.nan)) else float(row["orders_mom_med"]),
-                "unrate_chg_3m": None if pd.isna(row["unrate_chg_3m"]) else float(row["unrate_chg_3m"]),
-                "yc_10y2y": None if pd.isna(row["yc_10y2y"]) else float(row["yc_10y2y"]),
-                "hy_oas": None if pd.isna(row["hy_oas"]) else float(row["hy_oas"]),
-                "stlfsi4": None if pd.isna(row["stlfsi4"]) else float(row["stlfsi4"]),
-                "vix": None if pd.isna(row["vix"]) else float(row["vix"]),
-                "hmm_score": None if pd.isna(row.get("hmm_score", np.nan)) else float(row["hmm_score"]),
-                "prob_regime_0": None if pd.isna(row.get("prob_regime_0", np.nan)) else float(row["prob_regime_0"]),
-                "prob_regime_1": None if pd.isna(row.get("prob_regime_1", np.nan)) else float(row["prob_regime_1"]),
-                "prob_regime_2": None if pd.isna(row.get("prob_regime_2", np.nan)) else float(row["prob_regime_2"]),
-                "prob_regime_3": None if pd.isna(row.get("prob_regime_3", np.nan)) else float(row["prob_regime_3"]),
-                "updated_at": now_utc,
-            }
-        )
+        rec: Dict[str, Any] = {
+            "date": str(row["date"]),
+            "regime_id": int(row["regime_id"]),
+            "regime_label": str(row["regime_label"]),
+            "stress_flag": bool(row["stress_flag"]),
+            "stress_score": None if pd.isna(row["stress_score"]) else float(row["stress_score"]),
+            "stress_driver": str(row["stress_driver"]) if "stress_driver" in row else None,
+            "core_cpi_yoy": None if pd.isna(row["core_cpi_yoy"]) else float(row["core_cpi_yoy"]),
+            "core_cpi_yoy_med": None if pd.isna(row.get("core_cpi_yoy_med", np.nan)) else float(row["core_cpi_yoy_med"]),
+            "orders_yoy": None if pd.isna(row["orders_yoy"]) else float(row["orders_yoy"]),
+            "orders_mom": None if pd.isna(row.get("orders_mom", np.nan)) else float(row["orders_mom"]),
+            "orders_mom_med": None if pd.isna(row.get("orders_mom_med", np.nan)) else float(row["orders_mom_med"]),
+            "unrate_chg_3m": None if pd.isna(row["unrate_chg_3m"]) else float(row["unrate_chg_3m"]),
+            "yc_10y2y": None if pd.isna(row["yc_10y2y"]) else float(row["yc_10y2y"]),
+            "hy_oas": None if pd.isna(row["hy_oas"]) else float(row["hy_oas"]),
+            "stlfsi4": None if pd.isna(row["stlfsi4"]) else float(row["stlfsi4"]),
+            "vix": None if pd.isna(row["vix"]) else float(row["vix"]),
+            "hmm_score_raw": None if pd.isna(row.get("hmm_score_raw", np.nan)) else float(row["hmm_score_raw"]),
+            "hmm_score_0_100": None if pd.isna(row.get("hmm_score_0_100", np.nan)) else float(row["hmm_score_0_100"]),
+            "updated_at": now_utc,
+        }
+
+        for c in prob_cols:
+            rec[c] = None if pd.isna(row.get(c, np.nan)) else float(row[c])
+
+        out.append(rec)
+
     return out
 
 
@@ -1129,6 +1071,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stress-quantile", type=float, default=0.80)
     p.add_argument("--stress-roll-window", type=int, default=756)
     p.add_argument("--stress-min-periods", type=int, default=252)
+
+    # HMM
+    p.add_argument("--hmm-model-path", type=str, default=None, help=f"default: {DEFAULT_MODEL_PATH}")
+    p.add_argument("--no-hmm", action="store_true", help="disable HMM inference even if model exists")
 
     p.add_argument("--debug", action="store_true", help="print debug diagnostics")
     p.add_argument("--debug-n", type=int, default=5, help="head/tail rows to print for debug tables")
@@ -1170,34 +1116,40 @@ def main() -> int:
         debug_n=args.debug_n,
     )
 
+    if not args.no_hmm:
+        model_path = args.hmm_model_path or DEFAULT_MODEL_PATH
+        state = try_apply_hmm(state, model_path=model_path, debug=args.debug)
+
     if args.print_latest:
-        pd.set_option("display.max_columns", None)
-        pd.set_option("display.width", 1000)
-        print(
-            state.tail(1)[
-                [
-                    "regime_id",
-                    "regime_label",
-                    "stress_flag",
-                    "stress_score",
-                    "stress_driver",
-                    "core_cpi_yoy",
-                    "core_cpi_yoy_med",
-                    "orders_yoy",
-                    "orders_mom",
-                    "orders_mom_med",
-                    "unrate_chg_3m",
-                    "yc_10y2y",
-                    "hy_oas",
-                    "stlfsi4",
-                    "vix",
-                    "hmm_score", 
-                ]
-            ]
-        )
+        cols = [
+            "regime_id",
+            "regime_label",
+            "stress_flag",
+            "stress_score",
+            "stress_driver",
+            "core_cpi_yoy",
+            "core_cpi_yoy_med",
+            "orders_yoy",
+            "orders_mom",
+            "orders_mom_med",
+            "unrate_chg_3m",
+            "yc_10y2y",
+            "hy_oas",
+            "stlfsi4",
+            "vix",
+        ]
+
+        if "hmm_score_0_100" in state.columns:
+            cols += ["hmm_score_0_100", "hmm_score_raw"]
+            cols += [c for c in state.columns if c.startswith("prob_state_")]
+
+        print(state.tail(1)[cols].to_string())
 
     if args.print_sample:
-        print(state.tail(10)[["regime_id", "regime_label", "stress_flag", "stress_score", "stress_driver"]])
+        cols = ["regime_id", "regime_label", "stress_flag", "stress_score", "stress_driver"]
+        if "hmm_score_0_100" in state.columns:
+            cols += ["hmm_score_0_100"]
+        print(state.tail(10)[cols])
 
     if args.print_backtest:
         bt = backtest_daily(state)
