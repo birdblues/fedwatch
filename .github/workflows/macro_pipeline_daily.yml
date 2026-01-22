@@ -1,0 +1,50 @@
+# .github/workflows/macro_pipeline.yml
+name: macro-pipeline-daily
+
+on:
+  schedule:
+    # 22:30 UTC = 07:30 KST
+    - cron: "30 22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macro-pipeline
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline (save to Supabase)
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # optional (원하면 repo Variables로 빼도 됨)
+          SUPABASE_TABLE: macro_state_daily
+        run: |
+          set -euo pipefail
+          python scripts/pipeline_daily.py \
+            --start 2000-01-01 \
+            --save-supabase \
+            --print-latest \
+            --print-sample
