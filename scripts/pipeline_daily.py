@@ -169,6 +169,222 @@ def perf_stats_from_returns(r: pd.Series, freq: str = "D") -> Dict[str, Any]:
 
 
 # -----------------------------
+# HMM Helpers (NumPy Inference)
+# -----------------------------
+def logsumexp_np(a, axis=None, keepdims=False):
+    a = np.asarray(a)
+    amax = np.max(a, axis=axis, keepdims=True)
+    out = np.log(np.sum(np.exp(a - amax), axis=axis, keepdims=True)) + amax
+    return out if keepdims else np.squeeze(out, axis=axis)
+
+
+def mvn_logpdf_np(x, mu, cov):
+    # x:(D,), mu:(D,), cov:(D,D)
+    D = x.shape[0]
+    # add small jitter if needed, or assume trained cov is good.
+    # robust cholesky?
+    try:
+        L = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        # fallback jitter
+        L = np.linalg.cholesky(cov + np.eye(D) * 1e-6)
+        
+    y = np.linalg.solve(L, x - mu)
+    quad = np.dot(y, y)
+    logdet = np.sum(np.log(np.diag(L)))
+    return -0.5 * (D * np.log(2 * np.pi) + 2 * logdet + quad)
+
+
+def forward_backward_gamma(X, pi, A, mus, covs):
+    """
+    X:(T,D), pi:(K,), A:(K,K), mus:(K,D), covs:(K,D,D)
+    return gamma:(T,K)
+    """
+    T, D = X.shape
+    K = pi.shape[0]
+
+    emit = np.zeros((T, K))
+    for t in range(T):
+        row = X[t]
+        # if any nan in row, emit is 0 log prob? or uniform?
+        # we assume X is clean (ffill/dropna handled before)
+        if np.any(np.isnan(row)):
+             # Treat as missing obs -> uniform emission or skip update (complicated)
+             # Simple approach: uniform log prob (0 if normalized, but here logpdf... just set 0 means likelihood 1)
+             # But logic implies sum to 1.
+             # Let's assume input X is cleaned.
+             pass
+        
+        for k in range(K):
+            emit[t, k] = mvn_logpdf_np(row, mus[k], covs[k])
+
+    logA = np.log(A + 1e-30)
+    logpi = np.log(pi + 1e-30)
+
+    # forward
+    alpha = np.zeros((T, K))
+    alpha[0] = logpi + emit[0]
+    for t in range(1, T):
+        m = alpha[t - 1][:, None] + logA  # (K,K)
+        alpha[t] = emit[t] + logsumexp_np(m, axis=0)
+
+    # backward
+    beta = np.zeros((T, K))
+    beta[-1] = 0.0
+    for t in range(T - 2, -1, -1):
+        m = logA + emit[t + 1][None, :] + beta[t + 1][None, :]
+        beta[t] = logsumexp_np(m, axis=1)
+
+    log_gamma = alpha + beta
+    log_gamma = log_gamma - logsumexp_np(log_gamma, axis=1, keepdims=True)
+    gamma = np.exp(log_gamma)
+    return gamma
+
+
+def make_hmm_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Constructs the feature matrix X for HMM.
+    1. cpi_gap = core_cpi_yoy - core_cpi_yoy_med
+    2. orders_yoy
+    3. orders_gap = orders_mom - orders_mom_med
+    4. unrate_chg_3m
+    5. yc_10y2y
+    6. hy_oas
+    7. vix
+    8. stress_score
+    """
+    d = df.copy()
+    
+    # We need to handle NaNs because HMM cannot take NaNs
+    # Strategy: ffill first, then we might drop leading NaNs outside of this function
+    # But to return aligned DF, we keep index.
+    
+    # 1. cpi_gap
+    cpi_gap = d["core_cpi_yoy"] - d["core_cpi_yoy_med"]
+    
+    # 3. orders_gap
+    orders_gap = d["orders_mom"] - d["orders_mom_med"]
+    
+    X = pd.DataFrame({
+        "cpi_gap": cpi_gap,
+        "orders_yoy": d["orders_yoy"],
+        "orders_gap": orders_gap,
+        "unrate_chg": d["unrate_chg_3m"],
+        "yc_10y2y": d["yc_10y2y"],
+        "hy_oas": d["hy_oas"],
+        "vix": d["vix"],
+        "stress_score": d["stress_score"]
+    }, index=d.index)
+    
+    return X
+
+
+# -----------------------------
+# HMM Helpers (NumPy Inference)
+# -----------------------------
+def logsumexp_np(a, axis=None, keepdims=False):
+    a = np.asarray(a)
+    amax = np.max(a, axis=axis, keepdims=True)
+    out = np.log(np.sum(np.exp(a - amax), axis=axis, keepdims=True)) + amax
+    return out if keepdims else np.squeeze(out, axis=axis)
+
+
+def mvn_logpdf_np(x, mu, cov):
+    # x:(D,), mu:(D,), cov:(D,D)
+    D = x.shape[0]
+    # add small jitter if needed, or assume trained cov is good.
+    # robust cholesky?
+    try:
+        L = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        # fallback jitter
+        L = np.linalg.cholesky(cov + np.eye(D) * 1e-6)
+        
+    y = np.linalg.solve(L, x - mu)
+    quad = np.dot(y, y)
+    logdet = np.sum(np.log(np.diag(L)))
+    return -0.5 * (D * np.log(2 * np.pi) + 2 * logdet + quad)
+
+
+def forward_backward_gamma(X, pi, A, mus, covs):
+    """
+    X:(T,D), pi:(K,), A:(K,K), mus:(K,D), covs:(K,D,D)
+    return gamma:(T,K)
+    """
+    T, D = X.shape
+    K = pi.shape[0]
+
+    emit = np.zeros((T, K))
+    for t in range(T):
+        row = X[t]
+        if np.any(np.isnan(row)):
+             pass
+        
+        for k in range(K):
+            emit[t, k] = mvn_logpdf_np(row, mus[k], covs[k])
+
+    logA = np.log(A + 1e-30)
+    logpi = np.log(pi + 1e-30)
+
+    # forward
+    alpha = np.zeros((T, K))
+    alpha[0] = logpi + emit[0]
+    for t in range(1, T):
+        m = alpha[t - 1][:, None] + logA  # (K,K)
+        alpha[t] = emit[t] + logsumexp_np(m, axis=0)
+
+    # backward
+    beta = np.zeros((T, K))
+    beta[-1] = 0.0
+    for t in range(T - 2, -1, -1):
+        m = logA + emit[t + 1][None, :] + beta[t + 1][None, :]
+        beta[t] = logsumexp_np(m, axis=1)
+
+    log_gamma = alpha + beta
+    log_gamma = log_gamma - logsumexp_np(log_gamma, axis=1, keepdims=True)
+    gamma = np.exp(log_gamma)
+    return gamma
+
+
+def make_hmm_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Constructs the feature matrix X for HMM.
+    1. cpi_gap = core_cpi_yoy - core_cpi_yoy_med
+    2. orders_yoy
+    3. orders_gap = orders_mom - orders_mom_med
+    4. unrate_chg_3m
+    5. yc_10y2y
+    6. hy_oas
+    7. vix
+    8. stress_score
+    """
+    d = df.copy()
+    
+    # We need to handle NaNs because HMM cannot take NaNs
+    # Strategy: ffill first, then we might drop leading NaNs outside of this function
+    # But to return aligned DF, we keep index.
+    
+    # 1. cpi_gap
+    cpi_gap = d["core_cpi_yoy"] - d["core_cpi_yoy_med"]
+    
+    # 3. orders_gap
+    orders_gap = d["orders_mom"] - d["orders_mom_med"]
+    
+    X = pd.DataFrame({
+        "cpi_gap": cpi_gap,
+        "orders_yoy": d["orders_yoy"],
+        "orders_gap": orders_gap,
+        "unrate_chg": d["unrate_chg_3m"],
+        "yc_10y2y": d["yc_10y2y"],
+        "hy_oas": d["hy_oas"],
+        "vix": d["vix"],
+        "stress_score": d["stress_score"]
+    }, index=d.index)
+    
+    return X
+
+
+# -----------------------------
 # FRED Client (realtime-aware)
 # -----------------------------
 class FredClient:
@@ -681,7 +897,7 @@ def build_daily_state(
     regime_label = pd.Series(regime_label_list, index=daily_idx, name="regime_label")
 
     yc_10y2y = (dgs10 - dgs2).rename("yc_10y2y")
-
+    
     # ---- 6) Assemble
     out = pd.DataFrame(index=daily_idx)
     out["date"] = out.index.date
@@ -704,6 +920,78 @@ def build_daily_state(
     out["stlfsi4"] = stlfsi4_raw
     out["vix"] = vix
 
+    # ---- 7) Bayesian HMM Inference (if model exists)
+    # Check for models/hmm_v1.npz
+    model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "hmm_v1.npz")
+    if os.path.exists(model_path):
+        try:
+            model_data = np.load(model_path)
+            # Load params
+            pi = model_data["pi"]     # (K,)
+            A = model_data["A"]       # (K,K)
+            mus = model_data["mus"]   # (K,D)
+            covs = model_data["covs"] # (K,D,D)
+            x_mean = model_data["mean"] # (D,)
+            x_std = model_data["std"]   # (D,)
+            
+            # Prepare X
+            # Use make_hmm_features we defined. 
+            # Note: out df has the required raw columns now.
+            X_df = make_hmm_features(out)
+            
+            # Align with X_df columns order?
+            # We must ensure column order matches training.
+            # In make_hmm_features, we fixed the order: 
+            # cpi_gap, orders_yoy, orders_gap, unrate_chg, yc_10y2y, hy_oas, vix, stress_score
+            # Let's assume training used the same function.
+            
+            # Clean X for inference (no NaNs allowed)
+            # We can't forward-backward easily with NaNs in the middle without modifications.
+            # Simple strategy: Fillna with 0 (mean) since it's standardized? 
+            # Or ffill?
+            # Let's use ffill then bfill (to keep length T)
+            X_filled = X_df.ffill().bfill().fillna(0.0) 
+            
+            X_val = X_filled.values
+            
+            # Standardize
+            X_norm = (X_val - x_mean) / (x_std + 1e-6)
+            
+            # Run Inference
+            gamma = forward_backward_gamma(X_norm, pi, A, mus, covs) # (T, K)
+            
+            # Calc Score
+            # Option B: Good regimes = Goldilocks(0), Reflation(1) ??
+            # Need to know which index corresponds to which.
+            # The user code doesn't strictly enforce label mapping, PyMC sorts by something or random?
+            # Usually we need to Identify regimes after training.
+            # For now, let's assume the user handles label identification or we use a heuristic score.
+            # User suggested: score = 100 * sum(gamma[:, good_idx])
+            # Or weighted score.
+            
+            # Let's save the gamma columns so user can inspect or compute score later?
+            # Or compute a score based on "Good" regimes.
+            # Ideally, fit logic should save "score_weights" or similar.
+            # If not present, we might just save gammas.
+            
+            if "score_weights" in model_data:
+                score_k = model_data["score_weights"]
+                hmm_score = np.sum(gamma * score_k[None, :], axis=1)
+            else:
+                # Default fallback if explicit weights not saved
+                # Maybe assuming K=4 and order? Unsafe.
+                # Just save gammas for now.
+                hmm_score = np.full(len(out), np.nan)
+
+            # Assign to DataFrame
+            out["hmm_score"] = hmm_score
+            for k in range(gamma.shape[1]):
+                out[f"prob_regime_{k}"] = gamma[:, k]
+                
+        except Exception as e:
+            if debug:
+                eprint(f"[WARN] HMM Inference failed: {e}")
+    
     return out
 
 
@@ -814,6 +1102,11 @@ def make_rows_for_supabase(state_df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "hy_oas": None if pd.isna(row["hy_oas"]) else float(row["hy_oas"]),
                 "stlfsi4": None if pd.isna(row["stlfsi4"]) else float(row["stlfsi4"]),
                 "vix": None if pd.isna(row["vix"]) else float(row["vix"]),
+                "hmm_score": None if pd.isna(row.get("hmm_score", np.nan)) else float(row["hmm_score"]),
+                "prob_regime_0": None if pd.isna(row.get("prob_regime_0", np.nan)) else float(row["prob_regime_0"]),
+                "prob_regime_1": None if pd.isna(row.get("prob_regime_1", np.nan)) else float(row["prob_regime_1"]),
+                "prob_regime_2": None if pd.isna(row.get("prob_regime_2", np.nan)) else float(row["prob_regime_2"]),
+                "prob_regime_3": None if pd.isna(row.get("prob_regime_3", np.nan)) else float(row["prob_regime_3"]),
                 "updated_at": now_utc,
             }
         )
@@ -898,6 +1191,7 @@ def main() -> int:
                     "hy_oas",
                     "stlfsi4",
                     "vix",
+                    "hmm_score", 
                 ]
             ]
         )

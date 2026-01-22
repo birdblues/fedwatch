@@ -1,8 +1,12 @@
 pandas
-numpy
+numpy>=1.26,<2.0
 requests
 yfinance
 supabase
 beautifulsoup4
 python-dateutil
 plotly
+jax>=0.4.34,<0.5
+jaxlib>=0.4.34,<0.5
+numpyro>=0.15.0,<0.16
+arviz>=0.23.1
