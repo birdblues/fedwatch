@@ -403,6 +403,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--score-z-window-years", type=float, default=5.0, help="rolling zscore window for risk_off target")
     p.add_argument("--score-z-min-periods-ratio", type=float, default=0.4, help="min periods ratio for rolling zscore")
+    # --- A+B smoothing for emission -> gamma (affects beta_state fit) ---
+    p.add_argument("--emit-temperature", type=float, default=1.0, help="A: divide emission loglik by this (>1 makes gamma smoother)")
+    p.add_argument("--cov-inflate", type=float, default=1.0, help="B: multiply covs by this (>1 makes emission less peaky)")
     p.add_argument("--score-horizon", type=int, default=None, help="override horizon; default: W->13, else->63")
     p.add_argument("--score-lambda", type=float, default=1e-3, help="ridge lambda for beta_state")
     p.add_argument("--score-window-years", type=float, default=5.0, help="for diagnostics scaling window")
@@ -498,12 +501,20 @@ def main() -> int:
 
     corr_chol = post["corr_chol"].values
     sd_post = post["sd"].values
-    chol_mean = (corr_chol * sd_post[..., None]).mean(axis=(0, 1))
-    cov_mean = np.zeros((args.k, X_scaled.shape[1], X_scaled.shape[1]))
-    for k in range(args.k):
-        cov_mean[k] = chol_mean[k] @ chol_mean[k].T
+    L = corr_chol * sd_post[..., None]
+    cov_samps = L @ np.swapaxes(L, -1, -2)
+    cov_mean = cov_samps.mean(axis=(0, 1))
 
-    emit = _emission_loglik(X_scaled, mus_mean, cov_mean)
+    # --- emission loglik (optionally smoothed by A+B) ---
+    cov_inflate = float(args.cov_inflate)
+    emit_temperature = float(args.emit_temperature)
+
+    cov_for_emit = cov_mean * cov_inflate if cov_inflate != 1.0 else cov_mean
+    emit = _emission_loglik(X_scaled, mus_mean, cov_for_emit)
+
+    if emit_temperature != 1.0:
+        emit = emit / emit_temperature
+
     gamma = forward_backward_gamma(pi_mean, A_mean, emit)
 
     default_h = 13 if args.freq.upper() == "W" else 63
@@ -578,6 +589,8 @@ def main() -> int:
         "score_components": ["vix", "hy_oas", "stress_score"] if score_target == "risk_off" else ["spx"],
         "score_z_window_years": float(args.score_z_window_years),
         "score_z_min_periods_ratio": float(args.score_z_min_periods_ratio),
+        "emit_temperature": float(args.emit_temperature),
+        "cov_inflate": float(args.cov_inflate),
     }
     meta_json = json.dumps(meta, ensure_ascii=True)
 

@@ -595,7 +595,15 @@ def try_apply_hmm(state: pd.DataFrame, model_path: str, debug: bool = False) -> 
         X_val[nan_mask] = np.take(mean, np.where(nan_mask)[1])
     X_scaled = (X_val - mean[None, :]) / (std[None, :] + 1e-6)
 
-    log_emit = _mvnorm_logpdf_all(X_scaled, mus=mus, covs=covs)
+    # --- Apply A+B smoothing exactly as training meta (unless missing) ---
+    emit_temperature = float(meta.get("emit_temperature", 1.0))
+    cov_inflate = float(meta.get("cov_inflate", 1.0))
+
+    cov_for_emit = covs * cov_inflate if cov_inflate != 1.0 else covs
+    log_emit = _mvnorm_logpdf_all(X_scaled, mus=mus, covs=cov_for_emit)
+
+    if emit_temperature != 1.0:
+        log_emit = log_emit / emit_temperature
 
     logpi = np.log(pi + 1e-30)
     logA = np.log(A + 1e-30)
