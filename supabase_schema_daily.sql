@@ -6,6 +6,7 @@ create table if not exists public.macro_state_daily (
   stress_flag boolean default false,
   stress_score float8,
   stress_driver text,
+  stress_components jsonb,
   core_cpi_yoy float8,
   core_cpi_yoy_med float8,
   orders_yoy float8,

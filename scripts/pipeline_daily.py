@@ -927,6 +927,7 @@ def build_daily_state(
     out["stress_score"] = stress_score
     out["stress_flag"] = stress_flag.astype(bool)
     out["stress_driver"] = driver.astype(str)
+    out["stress_components"] = contrib_df.to_dict(orient="records")
 
     out["core_cpi_yoy"] = core_cpi_yoy
     out["core_cpi_yoy_med"] = core_cpi_yoy_med
@@ -1040,6 +1041,7 @@ def make_rows_for_supabase(state_df: pd.DataFrame) -> List[Dict[str, Any]]:
             "stress_flag": bool(row["stress_flag"]),
             "stress_score": None if pd.isna(row["stress_score"]) else float(row["stress_score"]),
             "stress_driver": str(row["stress_driver"]) if "stress_driver" in row else None,
+            "stress_components": row.get("stress_components"),
             "core_cpi_yoy": None if pd.isna(row["core_cpi_yoy"]) else float(row["core_cpi_yoy"]),
             "core_cpi_yoy_med": None if pd.isna(row.get("core_cpi_yoy_med", np.nan)) else float(row["core_cpi_yoy_med"]),
             "orders_yoy": None if pd.isna(row["orders_yoy"]) else float(row["orders_yoy"]),

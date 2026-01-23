@@ -270,7 +270,7 @@ def _risk_off_target(
     Build a risk-off target so higher values indicate lower stress.
     Target = -mean(zscore(vix), zscore(hy_oas), zscore(stress_score))
     """
-    cols = ["vix", "hy_oas", "stress_score"]
+    cols = ["vix", "hy_oas", "stlfsi4"]
     missing = [c for c in cols if c not in state.columns]
     if missing:
         raise RuntimeError(f"[train_hmm] missing state columns for risk target: {missing}")
@@ -289,8 +289,8 @@ def _risk_off_target(
 
     z_vix = _rolling_zscore(aligned["vix"], win, minp)
     z_hy = _rolling_zscore(aligned["hy_oas"], win, minp)
-    z_stress = _rolling_zscore(aligned["stress_score"], win, minp)
-    risk_off = -(z_vix + z_hy + z_stress) / 3.0
+    z_fsi = _rolling_zscore(aligned["stlfsi4"], win, minp)
+    risk_off = -(z_vix + z_hy + z_fsi) / 3.0
     risk_off.name = "risk_off_target"
     return risk_off
 
@@ -586,7 +586,7 @@ def main() -> int:
         "score_lambda": float(lam),
         "score_window_years": float(args.score_window_years),
         "score_target": score_target,
-        "score_components": ["vix", "hy_oas", "stress_score"] if score_target == "risk_off" else ["spx"],
+        "score_components": ["vix", "hy_oas", "stlfsi4"] if score_target == "risk_off" else ["spx"],
         "score_z_window_years": float(args.score_z_window_years),
         "score_z_min_periods_ratio": float(args.score_z_min_periods_ratio),
         "emit_temperature": float(args.emit_temperature),
