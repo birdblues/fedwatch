@@ -1,5 +1,6 @@
 -- Create the macro_state_daily table
-create table if not exists public.macro_state_daily (
+drop table if exists public.macro_state_daily;
+create table public.macro_state_daily (
   date date primary key,
   regime_id int not null,
   regime_label text not null,
@@ -17,6 +18,10 @@ create table if not exists public.macro_state_daily (
   hy_oas float8,
   stlfsi4 float8,
   vix float8,
+  skew float8,
+  sofr float8,
+  iorb float8,
+  sofr_minus_iorb float8,
   hmm_score_raw float8,
   hmm_score_0_100 float8,
   prob_state_0 float8,

@@ -57,6 +57,9 @@ DEFAULT_FRED_SERIES = {
     "dgs2": "DGS2",
     "dgs10": "DGS10",
     "hy_oas": "BAMLH0A0HYM2",
+    # Funding (daily)
+    "sofr": "SOFR",
+    "iorb": "IORB",
     # Weekly stress index
     "stlfsi4": "STLFSI4",
 }
@@ -64,6 +67,8 @@ DEFAULT_FRED_SERIES = {
 YF_TICKERS = {
     "spx": "^GSPC",
     "vix": "^VIX",
+    # CBOE SKEW Index (Yahoo Finance ticker is typically ^SKEW)
+    "skew": "^SKEW",
 }
 
 USER_AGENT = "macro-regime-pipeline/daily-1.0"
@@ -363,6 +368,7 @@ def fetch_yf_daily_close(ticker: str, start: pd.Timestamp, end: pd.Timestamp) ->
         ticker,
         start=str(start.date()),
         end=str((end + pd.Timedelta(days=1)).date()),
+        multi_level_index=False,
         progress=False,
     )
     if df is None or df.empty:
@@ -850,9 +856,10 @@ def build_daily_state(
     stlfsi4_raw = fred_daily_level(DEFAULT_FRED_SERIES["stlfsi4"])
     stlfsi4_raw.name = "stlfsi4"
 
-    # ---- 3) yfinance daily SPX/VIX
+    # ---- 3) yfinance daily SPX/VIX (+ optional SKEW)
     spx_close = fetch_yf_daily_close(YF_TICKERS["spx"], start, end)
     vix_close = fetch_yf_daily_close(YF_TICKERS["vix"], start, end)
+    skew_close = fetch_yf_daily_close(YF_TICKERS["skew"], start, end)
     if spx_close.empty:
         raise RuntimeError("yfinance ^GSPC fetch failed.")
     if vix_close.empty:
@@ -861,6 +868,20 @@ def build_daily_state(
     spx_close = spx_close.reindex(daily_idx).ffill()
     vix = vix_close.reindex(daily_idx).ffill()
     vix.name = "vix"
+
+    # SKEW is optional: if Yahoo doesn't return it, keep NaN (don't crash pipeline)
+    if skew_close is None or getattr(skew_close, "empty", True):
+        skew = pd.Series(index=daily_idx, dtype=float, name="skew")
+    else:
+        skew = skew_close.reindex(daily_idx).ffill()
+        skew.name = "skew"
+
+    # ---- 3.5) Funding rates (SOFR, IORB) from FRED
+    sofr = fred_daily_level(DEFAULT_FRED_SERIES["sofr"])
+    sofr.name = "sofr"
+    iorb = fred_daily_level(DEFAULT_FRED_SERIES["iorb"])
+    iorb.name = "iorb"
+    sofr_minus_iorb = (sofr - iorb).rename("sofr_minus_iorb")
 
     # ---- 4) Stress score (daily)
     dd = spx_close / spx_close.rolling(63, min_periods=20).max() - 1.0
@@ -939,6 +960,12 @@ def build_daily_state(
     out["hy_oas"] = hy_oas
     out["stlfsi4"] = stlfsi4_raw
     out["vix"] = vix
+
+    # Added: tail-risk & funding
+    out["skew"] = skew
+    out["sofr"] = sofr
+    out["iorb"] = iorb
+    out["sofr_minus_iorb"] = sofr_minus_iorb
 
     return out
 
@@ -1052,6 +1079,11 @@ def make_rows_for_supabase(state_df: pd.DataFrame) -> List[Dict[str, Any]]:
             "hy_oas": None if pd.isna(row["hy_oas"]) else float(row["hy_oas"]),
             "stlfsi4": None if pd.isna(row["stlfsi4"]) else float(row["stlfsi4"]),
             "vix": None if pd.isna(row["vix"]) else float(row["vix"]),
+            # Added
+            "skew": None if pd.isna(row.get("skew", np.nan)) else float(row["skew"]),
+            "sofr": None if pd.isna(row.get("sofr", np.nan)) else float(row["sofr"]),
+            "iorb": None if pd.isna(row.get("iorb", np.nan)) else float(row["iorb"]),
+            "sofr_minus_iorb": None if pd.isna(row.get("sofr_minus_iorb", np.nan)) else float(row["sofr_minus_iorb"]),
             "hmm_score_raw": None if pd.isna(row.get("hmm_score_raw", np.nan)) else float(row["hmm_score_raw"]),
             "hmm_score_0_100": None if pd.isna(row.get("hmm_score_0_100", np.nan)) else float(row["hmm_score_0_100"]),
             "updated_at": now_utc,

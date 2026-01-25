@@ -80,7 +80,7 @@ def fit_bayesian_hmm(
     K: int = 4,
     draws: int = 1000,
     tune: int = 500,
-    chains: int = 2,
+    chains: int = 4,
     sticky_strength: float = 25.0,
     seed: int = 42,
 ):
@@ -93,7 +93,7 @@ def fit_bayesian_hmm(
         num_warmup=tune,
         num_samples=draws,
         num_chains=chains,
-        chain_method="sequential",
+        chain_method="parallel",
         progress_bar=True,
     )
     rng_key = jax.random.PRNGKey(seed)
@@ -265,17 +265,36 @@ def _risk_off_target(
     weekly_anchor: str,
     window_years: float,
     min_periods_ratio: float,
+    mode: str,
 ) -> pd.Series:
     """
     Build a risk-off target so higher values indicate lower stress.
-    Target = -mean(zscore(vix), zscore(hy_oas), zscore(stress_score))
-    """
-    cols = ["vix", "hy_oas", "stlfsi4"]
-    missing = [c for c in cols if c not in state.columns]
-    if missing:
-        raise RuntimeError(f"[train_hmm] missing state columns for risk target: {missing}")
 
-    aligned = _align_state_to_freq(state[cols], idx, freq=freq, weekly_anchor=weekly_anchor)
+    mode:
+      - 'base'        : SKEW + HY_OAS + max(0, SOFR - IORB)         (NO STLFSI4)
+      - 'stlfsi4'     : base + STLFSI4
+      - 'stress_score': base + stress_score
+
+    Target = -mean(zscore(comp1), zscore(comp2), ...)
+    """
+    mode = str(mode).lower().strip()
+    if mode not in ("base", "stlfsi4", "stress_score"):
+        raise ValueError(f"Unsupported risk_off mode={mode}. Use base, stlfsi4, stress_score.")
+
+    required = ["skew", "hy_oas", "sofr", "iorb"]
+    extra_col: Optional[str] = None
+    if mode == "stlfsi4":
+        extra_col = "stlfsi4"
+        required = required + [extra_col]
+    elif mode == "stress_score":
+        extra_col = "stress_score"
+        required = required + [extra_col]
+
+    missing = [c for c in required if c not in state.columns]
+    if missing:
+        raise RuntimeError(f"[train_hmm] missing state columns for risk target ({mode}): {missing}")
+
+    aligned = _align_state_to_freq(state[required], idx, freq=freq, weekly_anchor=weekly_anchor)
     aligned = aligned.apply(pd.to_numeric, errors="coerce")
 
     freq_u = freq.upper()
@@ -287,10 +306,21 @@ def _risk_off_target(
         win = int(np.ceil(window_years * 252))
     minp = max(30, int(np.ceil(win * min_periods_ratio)))
 
-    z_vix = _rolling_zscore(aligned["vix"], win, minp)
+    z_skew = _rolling_zscore(aligned["skew"], win, minp)
     z_hy = _rolling_zscore(aligned["hy_oas"], win, minp)
-    z_fsi = _rolling_zscore(aligned["stlfsi4"], win, minp)
-    risk_off = -(z_vix + z_hy + z_fsi) / 3.0
+
+    # Funding tightness: only SOFR above IORB matters (upper-tail stress)
+    funding = (aligned["sofr"] - aligned["iorb"]).clip(lower=0.0)
+    z_funding = _rolling_zscore(funding, win, minp)
+
+    parts = [z_skew, z_hy, z_funding]
+
+    if extra_col is not None:
+        z_extra = _rolling_zscore(aligned[extra_col], win, minp)
+        parts.append(z_extra)
+
+    stress_mean = sum(parts) / float(len(parts))
+    risk_off = -stress_mean
     risk_off.name = "risk_off_target"
     return risk_off
 
@@ -384,7 +414,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", type=str, default=None, help="default: today(UTC)")
     p.add_argument("--draws", type=int, default=1000)
     p.add_argument("--tune", type=int, default=500)
-    p.add_argument("--chains", type=int, default=2)
+    p.add_argument("--chains", type=int, default=4)
     p.add_argument("--k", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sticky", type=float, default=25.0)
@@ -394,12 +424,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--min-years", type=float, default=5.0)
 
+    # Added: risk_off_stlfsi4
     p.add_argument(
         "--score-target",
         type=str,
         default="risk_off",
-        choices=["risk_off", "forward_return"],
-        help="score target: risk_off (default) or forward_return",
+        choices=["risk_off", "risk_off_stlfsi4", "risk_off_stress", "forward_return"],
+        help="score target: risk_off (base), risk_off_stlfsi4, risk_off_stress, or forward_return",
     )
     p.add_argument("--score-z-window-years", type=float, default=5.0, help="rolling zscore window for risk_off target")
     p.add_argument("--score-z-min-periods-ratio", type=float, default=0.4, help="min periods ratio for rolling zscore")
@@ -526,7 +557,20 @@ def main() -> int:
         spx_aligned = _align_spx_to_freq(spx_close, X_clean.index, args.freq, args.weekly_anchor)
         y = _forward_log_return(spx_aligned, horizon=horizon)
         score_mode = "B_continuous_expected_return"
+        score_components = ["spx"]
     else:
+        if score_target == "risk_off":
+            mode = "base"  # NO stlfsi4 here
+            score_components = ["skew", "hy_oas", "sofr_minus_iorb_pos"]
+        elif score_target == "risk_off_stlfsi4":
+            mode = "stlfsi4"
+            score_components = ["skew", "hy_oas", "sofr_minus_iorb_pos", "stlfsi4"]
+        elif score_target == "risk_off_stress":
+            mode = "stress_score"
+            score_components = ["skew", "hy_oas", "sofr_minus_iorb_pos", "stress_score"]
+        else:
+            raise RuntimeError(f"[train_hmm] unknown score_target={score_target}")
+
         y = _risk_off_target(
             state,
             X_clean.index,
@@ -534,6 +578,7 @@ def main() -> int:
             args.weekly_anchor,
             window_years=float(args.score_z_window_years),
             min_periods_ratio=float(args.score_z_min_periods_ratio),
+            mode=mode,
         )
         score_mode = "B_continuous_risk_off"
 
@@ -586,7 +631,7 @@ def main() -> int:
         "score_lambda": float(lam),
         "score_window_years": float(args.score_window_years),
         "score_target": score_target,
-        "score_components": ["vix", "hy_oas", "stlfsi4"] if score_target == "risk_off" else ["spx"],
+        "score_components": score_components,
         "score_z_window_years": float(args.score_z_window_years),
         "score_z_min_periods_ratio": float(args.score_z_min_periods_ratio),
         "emit_temperature": float(args.emit_temperature),
